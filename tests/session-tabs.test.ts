@@ -4,8 +4,9 @@ import type { On } from 'claude-code'
 import {
   badge,
   clientShowing,
+  cleanTitle,
   descendsFrom,
-  formatAge,
+  firstPrompt,
   isConversation,
   isRegistryFile,
   MAX_TABS,
@@ -17,8 +18,12 @@ import {
   parseSession,
   parseStat,
   pick,
+  SPINNER,
+  SPIN_MS,
   syncTabs,
   tabBadge,
+  tabTitle,
+  titleFromPrompt,
   tmuxLiteral,
   tmuxPane,
   windowName,
@@ -126,6 +131,12 @@ type Machine = {
   transcripts?: string[]
   /** Folders that no longer exist. */
   gone?: string[]
+  /** This session's conversation, as `$.session.messages()` returns it. */
+  messages?: { role: 'user' | 'assistant'; text: string }[]
+  /** What the small model answers when asked for a title; undefined refuses the call. */
+  modelReply?: string
+  /** False: the sidebar is open but not on screen (too narrow, or behind another pane). */
+  placed?: boolean
 }
 
 /** Stands in for the computer beneath the plugin: the registry, /proc, claude agents, tmux, ps and the panes. */
@@ -138,6 +149,8 @@ function machine(on: On, m: Machine = {}) {
   const reads: string[] = []
   const runs: string[][] = []
   const toasts: string[] = []
+  const prompts: string[] = []
+  let redraws = 0
   const open = new Set<string>()
   const clock = mock.clock(on, { now: NOW })
   mock.store(on, m.stored ?? {})
@@ -154,13 +167,26 @@ function machine(on: On, m: Machine = {}) {
     return { value: undefined }
   })
   on('ui.log', async () => ({ value: undefined }))
+  on('session.cwd', async () => ({ value: '/home/u/dev/app' }))
+  on('session.messages', async () => ({ value: (m.messages ?? []).map(msg => ({ ...msg, toolUses: [] })) }))
+  on('turn.complete', async (_$, e) => ({ text: e.answer }))
+  on('model.complete', async (_$, e) => {
+    prompts.push(typeof e.prompt === 'string' ? e.prompt : '')
+    if (m.modelReply === undefined) return { deny: 'no model here' }
+    const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+    return { value: { isAnswered: true as const, text: m.modelReply, usage } }
+  })
   on('ui.toast', async (_$, e) => {
     toasts.push(e.text)
     return { value: undefined }
   })
   on('ui.panes', async () => ({
-    value: [...open].map(id => ({ id, title: 'Sessions', isShown: true, isFocused: false, isPlaced: true, plugin: 'session-tabs' })),
+    value: [...open].map(id => ({ id, title: 'Sessions', isShown: m.placed ?? true, isFocused: false, isPlaced: m.placed ?? true, plugin: 'session-tabs' })),
   }))
+  on('ui.invalidate', async (_$, e, next) => {
+    redraws += 1
+    return next(e)
+  })
   on('fs.exists', async (_$, e) => {
     if (e.path === '/proc/self/stat') return { value: m.hasProc ?? true }
     const transcript = e.path.match(/^\/home\/u\/\.claude\/projects\/[^/]+(?:\/([^/]+)\.jsonl)?$/)
@@ -215,10 +241,17 @@ function machine(on: On, m: Machine = {}) {
   })
   const tmux = (verb: string) => runs.filter(argv => argv[0] === 'tmux' && argv[1] === verb)
   const claudeRuns = () => runs.filter(argv => argv[0] === 'claude').length
-  return { registry, jobs, reads, runs, tmux, claudeRuns, toasts, open, clock }
+  /** Redraws asked for while the clock moves on by `ms`. */
+  const redrawsOver = async (ms: number) => {
+    const before = redraws
+    await clock.advance(ms)
+    return redraws - before
+  }
+  return { registry, jobs, reads, runs, tmux, claudeRuns, toasts, prompts, open, clock, redrawsOver }
 }
 
-const mountPane = ($: Engine, surface: 'terminal' | 'desktop' = 'terminal') => $.ui.mount({ ...PANE, surface })
+const mountPane = ($: Engine, surface: 'terminal' | 'desktop' = 'terminal', bodyColumns = 30) =>
+  $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns }, surface })
 
 /** A refresh runs every 2 seconds, and a session must be missed twice to count as ended. */
 const ENDED_AFTER_MS = 4_000
@@ -358,6 +391,33 @@ describe('model', () => {
     expect(badge(session(ASKING))).toMatchObject({ tone: 'needs', label: 'input needed' })
   })
 
+  test("titles: a real name wins, then the session's own title, then the made-up name", async () => {
+    const rec: TabRecord = { sessionId: id(1), name: 'app-3f', cwd: '/', kind: 'interactive', openedAt: 0 }
+    expect(tabTitle(rec, 'Fix flaky tests')).toBe('Fix flaky tests')
+    expect(tabTitle(rec, undefined)).toBe('app-3f')
+    expect(tabTitle({ ...rec, name: 'auth refactor', isNamed: true }, 'Fix flaky tests')).toBe('auth refactor')
+    expect(syncTabs([], none, [{ ...session(OTHER), nameSource: 'user' }], none, [], NOW).upserts[0]?.isNamed).toBe(true)
+    expect(syncTabs([], none, [{ ...session(OTHER), nameSource: 'derived' }], none, [], NOW).upserts[0]?.isNamed).toBeUndefined()
+  })
+
+  test('titles from a first prompt: skip wrapped messages, tidy a model reply, cut a long line', async () => {
+    const messages = [
+      { role: 'user', text: '<command-name>/tabs</command-name>' },
+      { role: 'user', text: '\n  why do the tests flake on CI?\nthey pass locally' },
+    ]
+    expect(firstPrompt(messages)).toBe('why do the tests flake on CI?\nthey pass locally')
+    expect(firstPrompt([{ role: 'assistant', text: 'hi' }])).toBeUndefined()
+    expect(titleFromPrompt('why do the tests flake on CI?\nthey pass locally')).toBe('why do the tests flake on CI?')
+    expect(titleFromPrompt('x'.repeat(80))).toHaveLength(60)
+    expect(cleanTitle('"Flaky CI tests."\n')).toBe('Flaky CI tests')
+    expect(cleanTitle('Title: Debug flaky tests')).toBe('Debug flaky tests')
+    expect(cleanTitle('  ')).toBeUndefined()
+    // A pasted escape sequence never reaches the sidebar.
+    expect(titleFromPrompt('\x1b[31mERROR\x1b[0m\tdisk full')).toBe('[31mERROR [0m disk full')
+    expect(cleanTitle('Disk\u200b full\r')).toBe('Disk full')
+    expect(tabTitle({ sessionId: id(1), name: 'x', cwd: '/', kind: 'interactive', openedAt: 0 }, '\x1b[2Jboom')).toBe('[2Jboom')
+  })
+
   test('panes, clients, tmux text, ages and picking by number or name', async () => {
     expect(tmuxPane('0:@4.%7')).toBe('%7')
     expect(tmuxPane(undefined)).toBeNull()
@@ -367,7 +427,6 @@ describe('model', () => {
     expect(windowName('fix #{pane_id} now')).toBe('fix {pane_id} now')
     expect(windowName('')).toBe('claude')
     expect(tmuxLiteral('/home/u/#tag')).toBe('/home/u/##tag')
-    expect([5_000, 120_000, 7_200_000, 200_000_000].map(formatAge)).toEqual(['<1m', '2m', '2h', '2d'])
     const names = ['app-main', 'app-tests', 'docs']
     expect(pick(names, '1', n => n)).toBe('app-main')
     expect(pick(names, 'app-t', n => n)).toBe('app-tests')
@@ -382,11 +441,12 @@ describe('sidebar', () => {
     await $.session.start(START)
     for (const surface of ['terminal', 'desktop'] as const) {
       const ui = await mountPane($, surface)
-      expect((await ui.find({ type: 'Text', text: /3 tabs/ }))?.text).toContain('1 needs you')
+      expect((await ui.find({ type: 'Text', text: /3 sessions/ }))?.text).toContain('1 needs you')
       for (const hidden of ['ghost', 'recycled', 'spare', 'client', 'script']) expect(await ui.find({ text: hidden })).toBeUndefined()
       expect(await ui.find({ key: `go-${OTHER_ID}` })).toBeDefined()
       expect(await ui.find({ key: `go-${SELF_ID}` })).toBeUndefined()
-      expect(await ui.find({ type: 'Text', text: /input needed 2m · app/ })).toBeDefined()
+      expect((await ui.find({ key: `glyph-${ASKING_ID}` }))?.text).toBe('●')
+      expect((await ui.find({ key: `folder-${ASKING_ID}` }))?.text).toContain('app')
       await ui.unmount()
     }
     expect(reads.some(path => path.endsWith('.key'))).toBe(false)
@@ -396,12 +456,14 @@ describe('sidebar', () => {
   test('a tab stays after its session exits, and opening it resumes the session in a new tmux window', async ($, on) => {
     const { registry, tmux, clock } = machine(on)
     await $.session.start(START)
+    await clock.settle() // the refresh after the sidebar opens
     delete registry['200.json']
     await clock.advance(2_000)
     const ui = await mountPane($)
-    expect(await ui.find({ type: 'Text', text: /working 2m · tests/ })).toBeDefined() // missed once: shown as last seen
+    expect(SPINNER).toContain((await ui.find({ key: `glyph-${OTHER_ID}` }))?.text) // missed once: shown as last seen
     await clock.advance(2_000)
-    expect(await ui.find({ type: 'Text', text: /exited <1m · tests/ })).toBeDefined()
+    expect((await ui.find({ key: `glyph-${OTHER_ID}` }))?.text).toBe('–')
+    expect((await ui.find({ key: `folder-${OTHER_ID}` }))?.text).toContain('tests')
     await ui.press({ key: `go-${OTHER_ID}` })
     expect(tmux('new-window')).toEqual([
       [
@@ -424,7 +486,7 @@ describe('sidebar', () => {
     registry['200.json'] = record({ pid: 200, procStart: '2000', sessionId: id(30), name: 'fresh-start', tmux: '0:@4.%7', cwd: '/home/u/dev/tests' })
     await clock.advance(ENDED_AFTER_MS)
     const ui = await mountPane($)
-    expect(await ui.find({ type: 'Text', text: /3 tabs/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /3 sessions/ })).toBeDefined()
     expect((await ui.find({ key: `go-${id(30)}` }))?.text).toContain('fresh-start')
     expect(await ui.find({ key: `go-${OTHER_ID}` })).toBeUndefined()
     await ui.unmount()
@@ -437,7 +499,7 @@ describe('sidebar', () => {
     await clock.advance(ENDED_AFTER_MS)
     const ui = await mountPane($)
     expect(await ui.find({ text: 'docs' })).toBeUndefined()
-    expect(await ui.find({ type: 'Text', text: /2 tabs/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /2 sessions/ })).toBeDefined()
     await ui.unmount()
   })
 
@@ -478,7 +540,8 @@ describe('sidebar', () => {
     const { tmux } = machine(on, { jobs: [JOB] })
     await $.session.start(START)
     const ui = await mountPane($)
-    expect(await ui.find({ type: 'Text', text: /working 10m · api/ })).toBeDefined()
+    expect(SPINNER).toContain((await ui.find({ key: `glyph-${JOB_ID}` }))?.text)
+    expect((await ui.find({ key: `folder-${JOB_ID}` }))?.text).toContain('api')
     await ui.press({ key: `go-${JOB_ID}` })
     expect(tmux('new-window')[0]?.slice(-4)).toEqual(['--', 'claude', 'attach', 'b6e1f00d'])
     await ui.unmount()
@@ -514,7 +577,7 @@ describe('sidebar', () => {
     await ui.press({ key: `close-${OTHER_ID}` })
     await clock.advance(2_000)
     expect(await ui.find({ key: `go-${OTHER_ID}` })).toBeUndefined()
-    expect(await ui.find({ type: 'Text', text: /2 tabs/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /2 sessions/ })).toBeDefined()
     await $.command.run(tabs('reopen'))
     expect(await ui.find({ key: `go-${OTHER_ID}` })).toBeDefined()
     await $.command.run(tabs('close docs'))
@@ -614,13 +677,120 @@ describe('sidebar', () => {
   })
 })
 
+describe('titles, new sessions and the spinner', () => {
+  const turn = { answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' as const }
+
+  test('a session titles itself after its first turn, with a small model', async ($, on) => {
+    const { prompts, clock } = machine(on, { messages: [{ role: 'user', text: 'why do the tests flake on CI?' }], modelReply: '"Flaky CI tests"' })
+    await $.session.start(START)
+    await $.turn.complete(turn)
+    await clock.settle()
+    expect(prompts).toEqual(['why do the tests flake on CI?'])
+    const ui = await mountPane($)
+    expect(await ui.find({ text: 'Flaky CI tests' })).toBeDefined()
+    // Once titled, later turns ask nothing more.
+    await $.turn.complete({ ...turn, turnId: 't2' })
+    await clock.settle()
+    expect(prompts.length).toBe(1)
+    await ui.unmount()
+  })
+
+  test('without a small model, the first line of the first prompt is the title', async ($, on) => {
+    const { clock } = machine(on, { messages: [{ role: 'user', text: 'port the billing job to the new queue\nsee notes' }] })
+    await $.session.start(START)
+    await $.turn.complete(turn)
+    await clock.settle()
+    const ui = await mountPane($, 'terminal', 80)
+    expect((await ui.find({ type: 'Text', text: /^port the billing job/ }))?.text).toBe('port the billing job to the new queue')
+    await ui.unmount()
+  })
+
+  test('a session asks the model once, even when the call fails', async ($, on) => {
+    const { prompts, clock } = machine(on, { messages: [{ role: 'user', text: 'hello' }] })
+    await $.session.start(START)
+    for (const turnId of ['t1', 't2', 't3']) {
+      await $.turn.complete({ ...turn, turnId })
+      await clock.settle()
+    }
+    expect(prompts).toEqual(['hello'])
+  })
+
+  test('other sessions show the titles they gave themselves; a /rename wins', async ($, on) => {
+    const registry = { ...files(), '300.json': record({ pid: 300, procStart: '3000', sessionId: ASKING_ID, name: 'release notes', nameSource: 'user' }) }
+    machine(on, { files: registry, stored: { [`title:${OTHER_ID}`]: 'Fix flaky tests', [`title:${ASKING_ID}`]: 'Docs pass' } })
+    await $.session.start(START)
+    const ui = await mountPane($)
+    expect((await ui.find({ key: `go-${OTHER_ID}` }))?.text).toBe('Fix flaky tests')
+    expect((await ui.find({ key: `go-${ASKING_ID}` }))?.text).toBe('release notes')
+    await ui.unmount()
+  })
+
+  test('+ New session starts claude in a new tmux window in this folder and shows it', async ($, on) => {
+    const { tmux } = machine(on)
+    await $.session.start(START)
+    const ui = await mountPane($)
+    await ui.press({ key: 'new' })
+    expect(tmux('new-window')).toEqual([
+      ['tmux', 'new-window', '-d', '-P', '-F', '#{pane_id}', '-c', '/home/u/dev/app', '-e', 'PATH=/usr/bin', '--', 'claude'],
+    ])
+    expect(tmux('switch-client').at(-1)?.at(-1)).toBe('%41')
+    await $.command.run(tabs('new'))
+    expect(tmux('new-window').length).toBe(2)
+    await ui.unmount()
+  })
+
+  test('a working tab spins while the sidebar is on screen', async ($, on) => {
+    const { clock, redrawsOver } = machine(on)
+    await $.session.start(START)
+    await clock.settle()
+    const ui = await mountPane($)
+    const before = (await ui.find({ key: `glyph-${OTHER_ID}` }))?.text
+    expect(await redrawsOver(11 * SPIN_MS)).toBeGreaterThanOrEqual(9) // 11 frames: not back to the same glyph
+    expect(SPINNER).toContain(before)
+    expect((await ui.find({ key: `glyph-${OTHER_ID}` }))?.text).not.toBe(before)
+    expect((await ui.find({ key: `glyph-${SELF_ID}` }))?.text).toBe('○')
+    await ui.unmount()
+  })
+
+  test('nothing redraws when no tab is working', async ($, on) => {
+    const idle = { ...files(), '200.json': record({ pid: 200, procStart: '2000', sessionId: OTHER_ID, name: 'app-tests', tmux: '0:@4.%7' }) }
+    const { clock, redrawsOver } = machine(on, { files: idle })
+    await $.session.start(START)
+    await clock.settle()
+    expect(await redrawsOver(1_000)).toBe(0)
+  })
+
+  test('nothing spins while the sidebar is closed or off screen', async ($, on) => {
+    const closed = machine(on, { stored: { autoOpen: false } })
+    await $.session.start(START)
+    await closed.clock.settle()
+    expect(await closed.redrawsOver(1_000)).toBe(0)
+  })
+
+  test('nothing spins for a sidebar too narrow to be placed', async ($, on) => {
+    const { clock, redrawsOver } = machine(on, { placed: false })
+    await $.session.start(START)
+    await clock.settle()
+    expect(await redrawsOver(1_000)).toBe(0)
+  })
+
+  test('closing the sidebar stops the spinner', async ($, on) => {
+    const { clock, redrawsOver } = machine(on)
+    await $.session.start(START)
+    await clock.settle()
+    expect(await redrawsOver(1_000)).toBeGreaterThan(0)
+    await $.command.run(tabs(''))
+    expect(await redrawsOver(1_000)).toBe(0)
+  })
+})
+
 describe('without /proc', () => {
   test('claude agents --json --all decides which sessions run; this one always shows', async ($, on) => {
     const { clock } = machine(on, { hasProc: false })
     await $.session.start(START)
     await clock.settle()
     const ui = await mountPane($)
-    expect(await ui.find({ type: 'Text', text: /3 tabs/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /3 sessions/ })).toBeDefined()
     expect(await ui.find({ text: 'ghost' })).toBeUndefined()
     expect(await ui.find({ text: /app-main/ })).toBeDefined()
     await ui.unmount()

@@ -1,6 +1,6 @@
 {
   "name": "session-tabs",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "OpenCode-style session tabs for the Claude Code terminal: a sidebar of your sessions that stays until you close a tab, opening each in tmux",
   "author": { "name": "Nguyen Phan", "url": "https://github.com/NguyenPhan2810" },
   "repository": "https://github.com/NguyenPhan2810/claude-session-tabs",

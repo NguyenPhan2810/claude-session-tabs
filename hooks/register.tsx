@@ -1,10 +1,11 @@
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import {
   basename,
+  cleanTitle,
   clientShowing,
   descendsFrom,
-  formatAge,
+  firstPrompt,
   isConversation,
   isJobId,
   isRegistryFile,
@@ -17,8 +18,12 @@ import {
   parseStat,
   pick,
   projectDirName,
+  SPIN_MS,
+  spinnerFrame,
   syncTabs,
   tabBadge,
+  tabTitle,
+  titleFromPrompt,
   tmuxLiteral,
   tmuxPane,
   windowName,
@@ -30,11 +35,14 @@ import {
 
 const PANE = 'session-tabs'
 const TITLE = 'Sessions'
-const WIDTH = 30
+const WIDTH = 40
 const REFRESH_MS = 2_000
 /** How old the shared `claude agents` answer, or a failed attempt, may be before a session asks again. */
 const ROSTER_MAX_AGE_MS = 10_000
 const CLOSED_KEEP_MS = 30 * 24 * 3_600_000
+/** How a session asks a small model for its title, once, after its first turn. */
+const TITLE_SYSTEM =
+  "You name coding-assistant chat sessions. Reply with only a title of 3 to 5 words, at most 40 characters, for the conversation that starts with the user's message below: sentence case, no quotes, no trailing punctuation."
 /** The tmux pane option that marks a window this mod opened for a session. */
 const PANE_TAG = '@session-tabs'
 
@@ -49,8 +57,15 @@ let home = ''
 let hasProc = false
 let selfId: string | undefined
 let tabs: Tab[] = []
-/** The sessions taken as running at the last refresh. One missed refresh isn't an exit: the session is carried over once. */
-let carried = new Map<string, { session: Session; isMissed: boolean }>()
+/** The titles sessions gave themselves, by session id. */
+let titles = new Map<string, string>()
+let spinner: Timer | null = null
+let isTitling = false
+/** Sessions this module already asked the model about: one call each, even if saving the title failed. */
+const asked = new Set<string>()
+/** The sessions taken as running. One missing for less than MISS_GRACE_MS (a registry file caught mid-write) is carried over. */
+let carried = new Map<string, { session: Session; missingSince?: number }>()
+const MISS_GRACE_MS = 1_500
 let drawnKey = ''
 let refreshing: Promise<void> | null = null
 let isStale = false
@@ -60,9 +75,14 @@ const errorText = (error: unknown): string => (error instanceof Error ? error.me
 const tabKey = (sessionId: string) => `tab:${sessionId}`
 /** Closing lives under a key of its own that a refresh never writes, so another session's refresh can't undo it. */
 const closedKey = (sessionId: string) => `closed:${sessionId}`
+/** A session's title, written only by that session, so it never races another's write. */
+const titleKey = (sessionId: string) => `title:${sessionId}`
 
-const isPaneOpen = async ($: EngineInterface): Promise<boolean> =>
-  (await $.ui.panes()).some(pane => pane.id === PANE)
+/** Whether the sidebar is open, and whether it is actually on screen (placed, and the pane in front). */
+async function paneState($: EngineInterface): Promise<{ isOpen: boolean; isVisible: boolean }> {
+  const pane = (await $.ui.panes()).find(p => p.id === PANE)
+  return { isOpen: pane !== undefined, isVisible: pane !== undefined && pane.isPlaced && pane.isShown }
+}
 
 /** Re-reads everything; never rejects. A call made while one runs makes that one go round again. */
 function refresh($: EngineInterface): Promise<void> {
@@ -92,17 +112,20 @@ async function load($: EngineInterface): Promise<void> {
   const roster = await getRoster($, now)
   const jobs = roster.jobs ?? null
   const found = await liveSessions($, roster)
-  const live = found === null ? null : carryOver(found)
+  const live = found === null ? null : carryOver(found, now)
 
   // The tabs are kept in the store, one key each, shared by every session running the mod.
   const keys = await $.store.keys()
   const records = new Map<string, TabRecord>()
   const closed = new Map<string, number>()
+  const named = new Map<string, string>()
   for (const key of keys) {
     const value = await $.store.get(key)
     if (key.startsWith('tab:') && isTabRecord(value)) records.set(value.sessionId, value)
     if (key.startsWith('closed:') && typeof value === 'number') closed.set(key.slice('closed:'.length), value)
+    if (key.startsWith('title:') && typeof value === 'string') named.set(key.slice('title:'.length), value)
   }
+  titles = named
 
   // Without a registry listing, nothing can be told about what ended, so the tabs are left as they are.
   if (live !== null) {
@@ -128,25 +151,27 @@ async function load($: EngineInterface): Promise<void> {
       if (now - closedAt <= CLOSED_KEEP_MS || around.has(id)) continue
       await $.store.delete(tabKey(id))
       await $.store.delete(closedKey(id))
+      await $.store.delete(titleKey(id))
       records.delete(id)
       closed.delete(id)
     }
   }
   tabs = openTabs([...records.values()], new Set(closed.keys()), live ?? [], jobs ?? [])
+  const isWorking = tabs.some(t => tabBadge(t).tone === 'working')
+  animate($, isWorking && (await paneState($)).isVisible)
 
-  // Redraw when something visible or something a press acts on changed (ages are shown in minutes).
+  // Redraw when something visible or something a press acts on changed.
   const key = JSON.stringify([
     selfId,
     tabs.map(t => [
       t.record.sessionId,
-      t.record.name,
+      tabTitle(t.record, titles.get(t.record.sessionId)),
       t.record.cwd,
       t.record.kind,
       t.record.jobId,
       t.live?.pid,
       t.live?.tmux,
       tabBadge(t).label,
-      formatAge(now - sinceOf(t)),
     ]),
   ])
   if (key !== drawnKey) {
@@ -155,14 +180,86 @@ async function load($: EngineInterface): Promise<void> {
   }
 }
 
+/** Runs the spinner only while a tab is working and the sidebar is on screen: a redraw per frame, nothing otherwise. */
+function animate($: EngineInterface, isOn: boolean): void {
+  if (isOn && spinner === null) spinner = $.clock.every(SPIN_MS, () => $.ui.invalidate('ui.render'))
+  if (!isOn && spinner !== null) {
+    spinner.cancel()
+    spinner = null
+  }
+}
+
+/**
+ * Gives this session a title once it has a first prompt, as OpenCode titles its sessions: a few
+ * words from a small model, or the prompt's first line when that isn't available.
+ */
+async function ensureTitle($: EngineInterface): Promise<void> {
+  if (isTitling) return
+  isTitling = true
+  try {
+    const id = await $.session.id()
+    if ((await $.store.get(titleKey(id))) !== undefined) return
+    const prompt = firstPrompt(await $.session.messages())
+    if (prompt === undefined || asked.has(id)) return
+    asked.add(id)
+    let title = titleFromPrompt(prompt)
+    try {
+      const reply = await $.model.complete({ model: 'haiku', system: TITLE_SYSTEM, prompt: prompt.slice(0, 2_000), maxTokens: 24, timeoutMs: 15_000 })
+      if (reply.isAnswered) title = cleanTitle(reply.text) ?? title
+    } catch {
+      // No small model here (another provider, or blocked): the prompt's first line will do.
+    }
+    await $.store.set(titleKey(id), title)
+    void refresh($)
+  } finally {
+    isTitling = false
+  }
+}
+
+/** What a window the mod opens needs from this session's environment: PATH, config folder and renderer. */
+async function forwardedEnv($: EngineInterface): Promise<string[]> {
+  const path = await $.env.get('PATH')
+  const fullscreen = await $.env.get('CLAUDE_CODE_NO_FLICKER')
+  return [
+    ...(path === undefined ? [] : ['-e', `PATH=${path}`]),
+    ...(configDir === `${home}/.claude` ? [] : ['-e', `CLAUDE_CONFIG_DIR=${configDir}`]),
+    ...(fullscreen === undefined ? [] : ['-e', `CLAUDE_CODE_NO_FLICKER=${fullscreen}`]),
+  ]
+}
+
+/** Starts a new Claude Code session in a new tmux window, in this session's folder, and shows it. */
+async function newSession($: EngineInterface): Promise<void> {
+  try {
+    if ((await $.env.get('TMUX')) === undefined) {
+      $.ui.toast('Not inside tmux: run claude in a new terminal.')
+      return
+    }
+    const cwd = await $.session.cwd()
+    const win = await $.process.run([
+      'tmux', 'new-window', '-d', '-P', '-F', '#{pane_id}', '-c', tmuxLiteral(cwd),
+      ...(await forwardedEnv($)),
+      '--', 'claude',
+    ])
+    const pane = win.stdout.trim()
+    if (win.exitCode !== 0 || !/^%\d+$/.test(pane)) {
+      $.ui.toast(`tmux: ${win.stderr.trim() || "couldn't open a new window"}`)
+      return
+    }
+    await switchToPane($, pane)
+  } catch (error) {
+    $.ui.toast(`Couldn't start a session: ${errorText(error)}`)
+  }
+}
+
 /** The running sessions, plus any missed for the first time (a registry file caught mid-write), as last seen. */
-function carryOver(found: Session[]): Session[] {
-  const next = new Map(found.map(session => [session.sessionId, { session, isMissed: false }]))
+function carryOver(found: Session[], now: number): Session[] {
+  const next = new Map<string, { session: Session; missingSince?: number }>(found.map(session => [session.sessionId, { session }]))
   // A process now running another conversation (`/clear`) moved on; that isn't a missed read.
   const processes = new Set(found.map(s => `${s.pid}:${s.procStart}`))
   for (const [id, held] of carried) {
-    if (next.has(id) || held.isMissed || processes.has(`${held.session.pid}:${held.session.procStart}`)) continue
-    next.set(id, { session: held.session, isMissed: true })
+    if (next.has(id) || processes.has(`${held.session.pid}:${held.session.procStart}`)) continue
+    const missingSince = held.missingSince ?? now
+    if (now - missingSince < MISS_GRACE_MS) next.set(id, { session: held.session, missingSince })
   }
   carried = next
   return [...next.values()].map(held => held.session)
@@ -186,9 +283,6 @@ async function hasTranscript($: EngineInterface, r: TabRecord): Promise<boolean 
   if (!(await $.fs.exists(dir).catch(() => false))) return undefined
   return $.fs.exists(`${dir}/${r.sessionId}.jsonl`).catch(() => undefined)
 }
-
-const sinceOf = (t: Tab): number =>
-  t.live?.statusUpdatedAt ?? t.live?.startedAt ?? t.record.endedAt ?? t.job?.startedAt ?? t.record.openedAt
 
 /** The running sessions from Claude Code's registry: one record each, conversations only, processes alive. Null when the registry can't be listed. */
 async function liveSessions($: EngineInterface, roster: Roster): Promise<Session[] | null> {
@@ -342,14 +436,8 @@ async function openTab($: EngineInterface, tab: Tab): Promise<void> {
       $.ui.toast(`${r.name}'s folder ${r.cwd || '(unknown)'} is gone, so it can't be reopened from here.`)
       return
     }
-    // The new window runs with tmux's environment: hand it this session's PATH, config folder and renderer.
-    const path = await $.env.get('PATH')
-    const fullscreen = await $.env.get('CLAUDE_CODE_NO_FLICKER')
-    const forwarded = [
-      ...(path === undefined ? [] : ['-e', `PATH=${path}`]),
-      ...(configDir === `${home}/.claude` ? [] : ['-e', `CLAUDE_CONFIG_DIR=${configDir}`]),
-      ...(fullscreen === undefined ? [] : ['-e', `CLAUDE_CODE_NO_FLICKER=${fullscreen}`]),
-    ]
+    // The new window runs with tmux's environment: hand it this session's.
+    const forwarded = await forwardedEnv($)
     const win = await $.process.run([
       'tmux',
       'new-window',
@@ -441,14 +529,20 @@ export const register: Register = on => {
 
       // Poll only while the sidebar is open; `/tabs` refreshes on demand.
       $.clock.every(REFRESH_MS, () => {
-        void isPaneOpen($)
-          .then(isOpen => (isOpen ? refresh($) : undefined))
+        void paneState($)
+          .then(pane => {
+            if (pane.isVisible) return refresh($)
+            animate($, false)
+          })
           .catch(() => {})
       })
       await refresh($)
 
       if ((await $.store.get('autoOpen')) !== false) {
-        void $.ui.open({ id: PANE, title: TITLE, columns: WIDTH }).catch(() => {})
+        void $.ui
+          .open({ id: PANE, title: TITLE, columns: WIDTH })
+          .then(() => refresh($))
+          .catch(() => {})
       }
     } catch (error) {
       $.ui.log(`session-tabs: start failed: ${errorText(error)}`, { to: 'debug' })
@@ -457,8 +551,8 @@ export const register: Register = on => {
     try {
       await $.command.register({
         name: 'tabs',
-        description: 'Session tabs: toggle the sidebar, open a tab by number or name, close or reopen a tab',
-        argumentHint: '[N | name | close N | reopen]',
+        description: 'Session tabs: toggle the sidebar, open a tab by number or name, start, close or reopen one',
+        argumentHint: '[N | name | new | close N | reopen]',
         immediate: true,
       })
     } catch (error) {
@@ -467,17 +561,30 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // After a turn of this session's own conversation, give it a title if it has none yet.
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId === undefined && registryDir !== '') void ensureTitle($).catch(() => {})
+    return result
+  }).catch(() => undefined)
+
   on('command.run', { command: 'tabs' }, async ($, e) => {
     const [verb = '', ...rest] = e.args.trim().split(/\s+/)
     const query = rest.join(' ')
     if (verb === '') {
-      if (await isPaneOpen($)) {
+      // On screen: close it. Open but behind another pane, or closed: bring it up.
+      if ((await paneState($)).isVisible) {
         await $.ui.close({ id: PANE })
       } else {
         await $.store.set('autoOpen', true)
         await refresh($)
         await $.ui.open({ id: PANE, title: TITLE, columns: WIDTH, focus: true })
+        void refresh($)
       }
+      return {}
+    }
+    if (verb === 'new') {
+      await newSession($)
       return {}
     }
     await refresh($)
@@ -499,65 +606,78 @@ export const register: Register = on => {
 
   // Closing the sidebar yourself keeps it closed in new sessions until `/tabs` opens it again.
   on('ui.close', async ($, e, next) => {
+    if (e.id === PANE) animate($, false)
     if (e.id === PANE && e.origin.kind !== 'unload') void $.store.set('autoOpen', false).catch(() => {})
     return next(e)
   }).catch(() => undefined) // a failing hook must never keep the pane from closing
 
+  // OpenCode's sidebar: one card per tab, a spinner or dot and the title, the folder under it.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const now = await $.clock.now()
     const isDocked = e.props.placement === 'dock'
-    const room = Math.max(8, e.props.bodyColumns - 8)
+    const width = Math.max(12, e.props.bodyColumns)
+    // Room for the title: the width less the glyph, the close mark and the gaps between them.
+    const room = Math.max(8, width - 6)
+    const spin = spinnerFrame(now)
     const waiting = tabs.filter(t => t.record.sessionId !== selfId && tabBadge(t).tone === 'needs').length
+    const rule = (key: string) => (
+      <Box key={key}>
+        <Text color="subtle">{'─'.repeat(width)}</Text>
+      </Box>
+    )
 
-    const rows = tabs.map((t, i) => {
+    const cards = tabs.map((t, i) => {
       const b = tabBadge(t)
       const id = t.record.sessionId
-      const isSelf = id === selfId
-      const label = clip(t.record.name, isSelf ? room - 2 : room)
-      const name = isSelf ? (
-        <Text bold color="claude">
-          {`${i < 9 ? `${i + 1}: ` : ''}${label} ◂`}
-        </Text>
-      ) : (
-        <Button
-          key={`go-${id}`}
-          label={label}
-          plain
-          {...(i < 9 ? { hotkey: String(i + 1) } : {})}
-          onPress={() => openTab($, t)}
-        />
-      )
-      const status = `${b.label} ${formatAge(now - sinceOf(t))}`
-      return (
-        <Box key={`row-${id}`} flexDirection="column">
-          <Box flexDirection="row" columnGap={1}>
-            <Text color={b.color}>{b.glyph}</Text>
-            <Box flexGrow={1}>{name}</Box>
-            {!isDocked && (
-              <Text dimColor wrap="truncate-end">
-                {status}
-              </Text>
-            )}
-            <Button key={`close-${id}`} label="✕" plain dimColor onPress={() => closeTab($, id)} />
+      const title = clip(tabTitle(t.record, titles.get(id)), room)
+      const folder = basename(t.record.cwd)
+      const name =
+        id === selfId ? (
+          <Text bold wrap="truncate-end">
+            {title}
+          </Text>
+        ) : (
+          <Button key={`go-${id}`} label={title} plain dimColor onPress={() => openTab($, t)} />
+        )
+      const head = (
+        <Box flexDirection="row" columnGap={1}>
+          <Box key={`glyph-${id}`}>
+            <Text color={b.color}>{b.tone === 'working' ? spin : b.glyph}</Text>
           </Box>
-          {isDocked && (
+          <Box flexGrow={1}>{name}</Box>
+          {!isDocked && (
             <Text dimColor wrap="truncate-end">
-              {`  ${status} · ${basename(t.record.cwd)}`}
+              {folder}
             </Text>
           )}
+          <Button key={`close-${id}`} label="✕" plain dimColor onPress={() => closeTab($, id)} />
+        </Box>
+      )
+      if (!isDocked) return <Box key={`row-${id}`}>{head}</Box>
+      return (
+        <Box key={`row-${id}`} flexDirection="column">
+          {i > 0 && rule(`rule-${id}`)}
+          {head}
+          <Box key={`folder-${id}`}>
+            <Text color="inactive" wrap="truncate-end">
+              {`  ${folder}`}
+            </Text>
+          </Box>
         </Box>
       )
     })
 
     return (
-      <Box flexDirection="column" rowGap={isDocked ? 1 : 0}>
+      <Box flexDirection="column">
         <Text dimColor>
-          {`${tabs.length} tab${tabs.length === 1 ? '' : 's'}`}
+          {`${tabs.length} session${tabs.length === 1 ? '' : 's'}`}
           {waiting > 0 ? ` · ${waiting} need${waiting === 1 ? 's' : ''} you` : ''}
         </Text>
-        {tabs.length === 0 ? <Text dimColor>No sessions yet.</Text> : rows}
-        {isDocked && <Text dimColor>/tabs N · close N · reopen</Text>}
+        {isDocked && rule('rule-top')}
+        {tabs.length === 0 ? <Text dimColor>No sessions yet.</Text> : cards}
+        {isDocked && rule('rule-bottom')}
+        <Button key="new" label="+ New session" plain dimColor onPress={() => newSession($)} />
       </Box>
     )
   })

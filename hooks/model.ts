@@ -22,6 +22,8 @@ export type Session = {
   parkedJobId?: string
   /** A background session's id for `claude attach`. */
   jobId?: string
+  /** Where `name` came from: `derived` and `collision` are made up from the folder; `user`, `auto` and `hook` say something. */
+  nameSource?: string
 }
 
 /** A background session as `claude agents --json --all` lists it: running, waiting or finished. */
@@ -41,6 +43,8 @@ export type TabRecord = {
   cwd: string
   kind: 'interactive' | 'background'
   jobId?: string
+  /** Whether `name` says what the session is about (set with /rename, or by Claude Code), not made up from the folder. */
+  isNamed?: boolean
   openedAt: number
   /** The process last seen running the session, to follow a terminal that starts a new conversation. */
   pid?: number
@@ -104,8 +108,13 @@ export function parseSession(text: string): Session | null {
     spare: o.spare === true,
     parkedJobId: str(o.parkedJobId),
     jobId,
+    nameSource: str(o.nameSource),
   }
 }
+
+/** Whether a registry name says what the session is about, rather than being made up from its folder. */
+export const isMeaningfulName = (s: Session): boolean =>
+  s.nameSource !== undefined && s.nameSource !== 'derived' && s.nameSource !== 'collision'
 
 /** Whether a registry entry is a conversation worth a tab, not a spare worker or a terminal that only shows a background one. */
 export const isConversation = (s: Session): boolean => !s.spare && s.parkedJobId === undefined
@@ -248,6 +257,7 @@ export function syncTabs(
       name: s.name,
       cwd: s.cwd,
       kind,
+      ...(isMeaningfulName(s) ? { isNamed: true } : {}),
       openedAt: held?.openedAt ?? (s.startedAt || now),
       pid: s.pid,
       ...(s.procStart === undefined ? {} : { procStart: s.procStart }),
@@ -264,6 +274,8 @@ export function syncTabs(
       cwd: job.cwd || held?.cwd || '',
       kind: 'background',
       jobId: job.id,
+      // Claude Code names a background session from its task; until then its name is its id.
+      ...(job.name !== job.id ? { isNamed: true } : {}),
       openedAt: held?.openedAt ?? (job.startedAt || now),
       ...(held?.pid === undefined ? {} : { pid: held.pid }),
       ...(held?.procStart === undefined ? {} : { procStart: held.procStart }),
@@ -347,15 +359,6 @@ export function tabBadge(tab: Tab): Badge {
   return { glyph: '–', color: 'inactive', label: 'exited', tone: 'other' }
 }
 
-export function formatAge(ms: number): string {
-  const m = Math.max(0, Math.floor(ms / 60_000))
-  if (m < 1) return '<1m'
-  if (m < 60) return `${m}m`
-  const h = Math.floor(m / 60)
-  if (h < 24) return `${h}h`
-  return `${Math.floor(h / 24)}d`
-}
-
 export function basename(path: string): string {
   const parts = path.split('/').filter(Boolean)
   return parts.at(-1) ?? path
@@ -374,6 +377,47 @@ export function pick<T>(items: readonly T[], query: string, nameOf: (item: T) =>
   const lower = q.toLowerCase()
   const name = (item: T) => nameOf(item).toLowerCase()
   return items.find(item => name(item) === lower) ?? items.find(item => name(item).startsWith(lower))
+}
+
+/**
+ * What a tab is called: a name that says something (set with /rename, or by Claude Code), else the
+ * title the session gave itself from its first prompt, else its made-up name.
+ */
+export const tabTitle = (r: TabRecord, title: string | undefined): string =>
+  plainText(r.isNamed === true ? r.name : (title ?? r.name)) || plainText(r.name) || 'session'
+
+/** Text safe to draw on one line: control and format characters (a pasted escape sequence) become spaces. */
+export const plainText = (text: string): string =>
+  text.replace(/[\p{Cc}\p{Cf}]/gu, ' ').replace(/\s+/g, ' ').trim()
+
+/** The braille spinner a working tab shows, one frame per SPIN_MS. */
+export const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+export const SPIN_MS = 120
+export const spinnerFrame = (now: number): string => SPINNER[Math.floor(now / SPIN_MS) % SPINNER.length]!
+
+const TITLE_MAX = 60
+
+/** The text of the conversation's first prompt, skipping what Claude Code wraps in tags (commands, notices). */
+export function firstPrompt(messages: readonly { role: string; text: string }[]): string | undefined {
+  for (const m of messages) {
+    const text = m.text.trim()
+    if (m.role === 'user' && text !== '' && !text.startsWith('<')) return text
+  }
+  return undefined
+}
+
+/** A title made from a prompt with no model: its first line, cut short. */
+export function titleFromPrompt(prompt: string): string {
+  const line = prompt.split('\n').map(plainText).find(l => l !== '') ?? plainText(prompt)
+  return line.length <= TITLE_MAX ? line : `${line.slice(0, TITLE_MAX - 1)}…`
+}
+
+/** A model's title, tidied: one line, no quotes or trailing period; undefined when nothing usable is left. */
+export function cleanTitle(text: string): string | undefined {
+  const line = text.split('\n').map(plainText).find(l => l !== '')
+  if (line === undefined) return undefined
+  const title = line.replace(/^(title:\s*)/i, '').replace(/^["'`*]+|["'`*.]+$/g, '').trim()
+  return title === '' ? undefined : title.slice(0, TITLE_MAX)
 }
 
 /** The folder under `~/.claude/projects` that holds a directory's transcripts: every non-alphanumeric becomes `-`. */
