@@ -1,25 +1,29 @@
 # session-tabs
 
-Vertical session tabs for the Claude Code terminal UI: a sidebar listing every Claude Code session
-running on your machine, with its status. Inside tmux it jumps to another session's pane on click or
-with `/tabs N`.
+OpenCode-style session tabs for the Claude Code terminal UI: a sidebar with a tab for each of your
+Claude Code sessions. A tab stays until you close it, even after its session ends, and clicking it
+takes you there in tmux.
 
 ```
-│2 sessions · 1 needs you
+│4 tabs · 1 needs you
 │
-│● 1: api-refactor
+│● 1: api-refactor            ✕
 │  working 3m · backend
 │
-│● 2: docs-pass
+│● 2: docs-pass               ✕
 │  input needed 1m · docs
 │
-│○ 3: frontend ◂
-│  idle 12m · web
+│– 3: flaky-test-hunt         ✕
+│  exited 2h · web
 │
-│/tabs N to switch
+│✓ 4: nightly-cleanup         ✕
+│  done 20m · infra
+│
+│/tabs N · close N · reopen
 ```
 
-`●` working, `●` (yellow) waiting for you, `○` idle. `◂` marks the session you're in.
+`●` working, `●` (yellow) waiting for you, `○` idle, `–` exited, `✓` done (background). `◂` marks
+the session you're in.
 
 It's a [Claude Code mod](https://code.claude.com/docs/en/plugins/mods/overview), a plugin of
 function hooks. Built and tested on Claude Code 2.1.294, on Linux with tmux 3.4.
@@ -36,44 +40,69 @@ Answer `y` to add the marketplace, then pick a scope (user scope runs it in ever
 
 ## Use
 
-- The sidebar opens by itself in each new session once the terminal is at least 144 columns wide.
-- **`/tabs`** toggles it. If you close it, it stays closed in new sessions until you run `/tabs` again.
-- **`/tabs 2`** or **`/tabs docs`** switches to session 2, or to the first session whose name starts
-  with `docs`. Works from the prompt, even while Claude is working.
-- Click a session, or focus the pane (`Ctrl+X` then `Tab`) and press its number.
+- **Click a tab**, or type **`/tabs 2`** / **`/tabs docs`** (a name prefix), to go to that session:
+  - running in a tmux pane: your terminal jumps to that pane
+  - exited: it's reopened (`claude --resume`) in a new tmux window, and you jump there
+  - a background session: it's opened (`claude attach`) in a new tmux window, or the window
+    already showing it
+- **✕** or **`/tabs close 2`** closes a tab. Like OpenCode, that only hides it: a background
+  session keeps running, and any conversation can still be resumed. **`/tabs reopen`** brings back
+  the last tab you closed.
+- **`/tabs`** toggles the sidebar. If you close the sidebar, it stays closed in new sessions until
+  you run `/tabs` again.
+- Focus the sidebar (`Ctrl+X` then `Tab`) to open a tab by its number key.
+
+Tabs are shared by all your sessions and kept across restarts. A tab closes on its own only when
+there's nothing left to open: a session that ended before its first message, or a background
+session you deleted (`claude rm`, or `Ctrl+X` twice in `claude agents`). Past 40 tabs, the ones
+whose sessions ended longest ago close.
+
+### Sessions that keep running without a terminal
+
+Like OpenCode's background server, Claude Code can run sessions in a background service that
+outlives your terminal: start one with `claude --bg "task"`, or press `←` on an empty prompt (or run
+`/bg`) to move the current one there. Its tab shows its progress, and clicking it attaches. A plain
+`claude` session lives in its terminal: when you exit, its tab stays as exited and clicking it
+resumes the conversation.
 
 ### Fullscreen gives you the sidebar
 
 Claude Code docks a mod's pane beside the transcript only in
 [fullscreen rendering](https://code.claude.com/docs/en/fullscreen). Under the classic renderer
-the list sits in a compact block above the prompt instead. Switch with `/tui fullscreen`, or start with `CLAUDE_CODE_NO_FLICKER=1 claude`.
+the list sits in a compact block above the prompt instead. Switch with `/tui fullscreen`, or start
+with `CLAUDE_CODE_NO_FLICKER=1 claude`. The sidebar opens by itself once the terminal is at least
+144 columns wide.
 
 ### Switching needs tmux
 
-Claude Code can't move your terminal from one session to another, so switching goes through tmux:
-each session records the tmux pane it runs in, and the mod runs `tmux switch-client -t <pane>`.
-That needs both sessions in the same tmux server. A session that isn't in tmux still shows in the
-list with its status, but pressing it just says it can't be reached from here. For background
-sessions, use `claude agents`.
+A mod can't move your terminal from one session to another, so tabs open through tmux: a session's
+own pane, or a new window. Outside tmux, opening a tab tells you the command to run instead.
 
 ## How it works
 
-- While the sidebar is open, it reads Claude Code's session registry every 2 seconds:
-  `~/.claude/sessions/<pid>.json`, or under `$CLAUDE_CONFIG_DIR`. It reads only those `.json`
+- While the sidebar is open, every 2 seconds it reads Claude Code's session registry,
+  `~/.claude/sessions/<pid>.json` (or under `$CLAUDE_CONFIG_DIR`). It reads only those `.json`
   files and never the `.key` files beside them. With the sidebar closed it polls nothing.
-- A crashed session can leave its file behind, and its pid can later belong to another program.
-  On Linux the mod compares each session's recorded start time with `/proc/<pid>/stat`. Elsewhere
-  it runs `claude agents --json` every 15 seconds.
-- Before switching, it asks tmux which process runs in the target pane and checks the session runs
-  under it, so it never jumps to a same-numbered pane on another tmux server. It switches the
-  terminal that's showing your current session.
+- Background sessions, finished ones included, come from `claude agents --json --all`. Every
+  session shares one answer through the mod's store, so the machine runs it at most once per
+  10 seconds.
+- A crashed session can leave its registry file behind, and its pid can later belong to another
+  program. On Linux the mod compares each session's recorded start time with `/proc/<pid>/stat`;
+  elsewhere it uses the `claude agents` answer.
+- Tabs live in the mod's own store (`~/.claude/plugins/store/`), one entry per tab, with closing
+  kept apart so two sessions refreshing at once can't undo a close.
+- Before jumping to a running session's pane, it asks tmux which process runs there and checks the
+  session runs under it, so it never jumps to a same-numbered pane on another tmux server. Windows
+  it opens are tagged with the tmux pane option `@session-tabs`, so a second click goes to the
+  same window.
 
-The registry format is internal to Claude Code and may change between releases. If it does, the list
-may come up empty until this mod is updated.
+The registry format is internal to Claude Code and may change between releases. If it does, the
+list may come up empty until this mod is updated.
 
-Mods are not sandboxed: this one runs with your user's permissions. It reads only the registry
-folder and `/proc/<pid>/stat`. It runs only `tmux`, plus `ps` and `claude agents --json` on systems
-without `/proc`.
+Mods are not sandboxed: this one runs with your user's permissions. It reads the registry folder,
+`/proc/<pid>/stat` and whether a session's transcript exists. It runs `claude agents --json --all`,
+`tmux`, `claude --resume` or `claude attach` in the windows it opens, and `ps` on systems without
+`/proc`.
 
 ## Develop
 

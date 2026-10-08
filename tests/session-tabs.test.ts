@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from 'claude-code/testing'
+import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import {
@@ -6,20 +6,38 @@ import {
   clientShowing,
   descendsFrom,
   formatAge,
+  isConversation,
   isRegistryFile,
+  MAX_TABS,
+  MISSING_GRACE_MS,
+  openTabs,
   orderSessions,
-  parseLivePids,
   parseProcessTable,
+  parseRoster,
   parseSession,
   parseStat,
   pick,
+  syncTabs,
+  tabBadge,
+  tmuxLiteral,
   tmuxPane,
+  windowName,
+  type Session,
+  type TabRecord,
 } from '../hooks/model'
 
 const NOW = 1_800_000_000_000
 const HOME = '/home/u'
 const DIR = `${HOME}/.claude/sessions`
 const START = { cwd: '/home/u/dev/app', surface: 'terminal' as const, isInteractive: true }
+
+const id = (n: number) => `a${String(n).padStart(7, '0')}-0000-4000-8000-000000000000`
+const SELF_ID = id(1)
+const OTHER_ID = id(2)
+const ASKING_ID = id(3)
+const CRASHED_ID = id(4)
+const REUSED_ID = id(5)
+const JOB_ID = id(6)
 
 const record = (over: Record<string, unknown>) =>
   JSON.stringify({
@@ -32,20 +50,29 @@ const record = (over: Record<string, unknown>) =>
   })
 
 // This session (pid 100, pane %8), and the others the registry holds.
-const SELF = record({ pid: 100, procStart: '1000', sessionId: 'self', name: 'app-main', tmux: '0:@4.%8', startedAt: NOW - 7_200_000 })
-const OTHER = record({ pid: 200, procStart: '2000', sessionId: 'other', name: 'app-tests', tmux: '0:@4.%7', status: 'busy' })
-const ASKING = record({ pid: 300, procStart: '3000', sessionId: 'asking', name: 'docs', waitingFor: 'input needed', status: 'waiting' })
-const CRASHED = record({ pid: 400, procStart: '4000', sessionId: 'crashed', name: 'ghost', startedAt: NOW - 9_000_000 })
-const REUSED = record({ pid: 500, procStart: '5000', sessionId: 'reused', name: 'recycled' })
+const SELF = record({ pid: 100, procStart: '1000', sessionId: SELF_ID, name: 'app-main', tmux: '0:@4.%8', startedAt: NOW - 7_200_000 })
+const OTHER = record({ pid: 200, procStart: '2000', sessionId: OTHER_ID, name: 'app-tests', tmux: '0:@4.%7', status: 'busy', cwd: '/home/u/dev/tests' })
+const ASKING = record({ pid: 300, procStart: '3000', sessionId: ASKING_ID, name: 'docs', waitingFor: 'input needed', status: 'waiting' })
+const CRASHED = record({ pid: 400, procStart: '4000', sessionId: CRASHED_ID, name: 'ghost', startedAt: NOW - 9_000_000 })
+const REUSED = record({ pid: 500, procStart: '5000', sessionId: REUSED_ID, name: 'recycled' })
+const SPARE = record({ pid: 600, procStart: '6000', sessionId: id(7), name: 'spare', kind: 'bg', spare: true })
+const PARKED = record({ pid: 700, procStart: '7000', sessionId: id(8), name: 'client', parkedJobId: 'job1' })
+const HEADLESS = record({ pid: 800, procStart: '8000', sessionId: id(10), name: 'script', kind: 'print' })
 
-const FILES: Record<string, string> = {
+const files = (): Record<string, string> => ({
   '100.json': SELF,
   '100.abc.key': 'secret',
   '200.json': OTHER,
   '300.json': ASKING,
   '400.json': CRASHED,
   '500.json': REUSED,
-}
+  '600.json': SPARE,
+  '700.json': PARKED,
+  '800.json': HEADLESS,
+})
+
+/** A background session the supervisor runs, as `claude agents --json --all` lists it. */
+const JOB = { id: 'b6e1f00d', kind: 'background', sessionId: JOB_ID, name: 'nightly-refactor', cwd: '/home/u/dev/api', state: 'running', startedAt: NOW - 600_000 }
 
 /** Running processes: pid → parent and start time. 10 and 20 are the tmux panes' shells. */
 const PROCS: Record<number, { ppid: number; start: string }> = {
@@ -55,6 +82,9 @@ const PROCS: Record<number, { ppid: number; start: string }> = {
   200: { ppid: 20, start: '2000' },
   300: { ppid: 1, start: '3000' },
   500: { ppid: 1, start: '9999' }, // pid 500 now belongs to some other program
+  600: { ppid: 1, start: '6000' },
+  700: { ppid: 1, start: '7000' },
+  800: { ppid: 1, start: '8000' },
 }
 
 /** A /proc/<pid>/stat line, with a process name holding a space and a parenthesis. */
@@ -63,6 +93,7 @@ const statOf = (pid: number, p: { ppid: number; start: string }) =>
 
 /** A command as typed at the prompt. */
 const TYPED = { origin: { kind: 'composer' as const }, presentation: { isFullscreen: true, columns: 200 } }
+const tabs = (args: string) => ({ ...TYPED, command: 'tabs', args })
 
 const PANE = {
   plugin: 'session-tabs',
@@ -86,25 +117,34 @@ type Machine = {
   panes?: Record<string, number>
   env?: Record<string, string>
   stored?: Record<string, unknown>
-  /** `claude agents --json` pids, for the machine without /proc. */
-  agents?: number[]
+  /** The background sessions `claude agents` lists; the array can change during a test. */
+  jobs?: object[]
+  failClaude?: boolean
   failTmux?: boolean
   failSessionId?: boolean
+  /** Sessions whose conversation Claude Code saved. */
+  transcripts?: string[]
+  /** Folders that no longer exist. */
+  gone?: string[]
 }
 
-/** Stands in for the computer beneath the plugin: the registry folder, /proc, tmux, ps and the panes. */
+/** Stands in for the computer beneath the plugin: the registry, /proc, claude agents, tmux, ps and the panes. */
 function machine(on: On, m: Machine = {}) {
-  const files = m.files ?? FILES
+  const registry = m.files ?? files()
   const panes = m.panes ?? { '%7': 20, '%8': 10 }
+  const tags = new Map<string, string>()
+  const jobs = m.jobs ?? []
+  const transcripts = m.transcripts ?? [SELF_ID, OTHER_ID, ASKING_ID]
   const reads: string[] = []
   const runs: string[][] = []
+  const toasts: string[] = []
   const open = new Set<string>()
   const clock = mock.clock(on, { now: NOW })
   mock.store(on, m.stored ?? {})
-  mock.env(on, m.env ?? { HOME, TMUX: '/tmp/tmux-1000/default,1,0', TMUX_PANE: '%8' })
+  mock.env(on, m.env ?? { HOME, PATH: '/usr/bin', TMUX: '/tmp/tmux-1000/default,1,0', TMUX_PANE: '%8' })
   // Nothing beneath the plugin answers these in a test, so the machine does
   on('session.start', async (_$, e) => ({ cwd: e.cwd }))
-  on('session.id', async () => (m.failSessionId ? { deny: 'no session yet' } : { value: 'self' }))
+  on('session.id', async () => (m.failSessionId ? { deny: 'no session yet' } : { value: SELF_ID }))
   on('ui.open', async (_$, e) => {
     open.add(e.id)
     return { value: { isPlaced: true as const } }
@@ -114,12 +154,21 @@ function machine(on: On, m: Machine = {}) {
     return { value: undefined }
   })
   on('ui.log', async () => ({ value: undefined }))
+  on('ui.toast', async (_$, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
   on('ui.panes', async () => ({
     value: [...open].map(id => ({ id, title: 'Sessions', isShown: true, isFocused: false, isPlaced: true, plugin: 'session-tabs' })),
   }))
-  on('fs.exists', async (_$, e) => ({ value: e.path === '/proc/self/stat' ? (m.hasProc ?? true) : false }))
+  on('fs.exists', async (_$, e) => {
+    if (e.path === '/proc/self/stat') return { value: m.hasProc ?? true }
+    const transcript = e.path.match(/^\/home\/u\/\.claude\/projects\/[^/]+(?:\/([^/]+)\.jsonl)?$/)
+    if (transcript !== null) return { value: transcript[1] === undefined || transcripts.includes(transcript[1]) }
+    return { value: e.path.startsWith('/home/u/dev/') && !(m.gone ?? []).includes(e.path) }
+  })
   on('fs.list', async () => ({
-    value: [...Object.keys(files), ...(m.links ?? [])].map(name => ({
+    value: [...Object.keys(registry), ...(m.links ?? [])].map(name => ({
       name,
       kind: 'file' as const,
       size: 1,
@@ -134,7 +183,7 @@ function machine(on: On, m: Machine = {}) {
       const p = PROCS[Number(proc[1])]
       return p !== undefined && (m.hasProc ?? true) ? { value: statOf(Number(proc[1]), p) } : { deny: 'ENOENT' }
     }
-    const text = files[e.path.slice(DIR.length + 1)]
+    const text = registry[e.path.slice(DIR.length + 1)]
     return text === undefined ? { deny: `ENOENT ${e.path}` } : { value: text }
   })
   on('process.run', async (_$, e) => {
@@ -143,7 +192,14 @@ function machine(on: On, m: Machine = {}) {
     const out = (stdout: string, exitCode = 0) => ({
       value: { exitCode, stdout, stderr: exitCode === 0 ? '' : 'failed', isStdoutTruncated: false, isStderrTruncated: false },
     })
-    if (argv[0] === 'claude') return out(JSON.stringify((m.agents ?? []).map(pid => ({ pid }))))
+    if (argv[0] === 'claude') {
+      if (m.failClaude) return out('', 1)
+      const interactive = Object.values(registry)
+        .map(text => parseSession(text))
+        .filter((s): s is Session => s !== null && s.kind === 'interactive' && PROCS[s.pid]?.start === s.procStart)
+        .map(s => ({ pid: s.pid, kind: 'interactive', sessionId: s.sessionId }))
+      return out(JSON.stringify([...interactive, ...jobs]))
+    }
     if (argv[0] === 'ps') return out(Object.entries(PROCS).map(([pid, p]) => `${pid} ${p.ppid}`).join('\n'))
     if (argv[0] !== 'tmux') return out('', 127)
     if (m.failTmux) return { deny: 'tmux is not allowed' }
@@ -152,18 +208,38 @@ function machine(on: On, m: Machine = {}) {
       return pid === undefined ? out('', 1) : out(`${pid}\n`)
     }
     if (argv[1] === 'list-clients') return out('100 /dev/pts/1 %8\n200 /dev/pts/2 %3\n')
+    if (argv[1] === 'list-panes') return out([...tags].map(([pane, tag]) => `${pane} ${tag}`).join('\n'))
+    if (argv[1] === 'new-window') return out(`%${40 + runs.filter(a => a[1] === 'new-window').length}\n`)
+    if (argv[1] === 'set-option') tags.set(argv[4]!, argv[6]!)
     return out('')
   })
-  const switches = () => runs.filter(argv => argv[0] === 'tmux' && argv[1] === 'switch-client')
-  return { reads, runs, switches, open, clock }
+  const tmux = (verb: string) => runs.filter(argv => argv[0] === 'tmux' && argv[1] === verb)
+  const claudeRuns = () => runs.filter(argv => argv[0] === 'claude').length
+  return { registry, jobs, reads, runs, tmux, claudeRuns, toasts, open, clock }
 }
 
+const mountPane = ($: Engine, surface: 'terminal' | 'desktop' = 'terminal') => $.ui.mount({ ...PANE, surface })
+
+/** A refresh runs every 2 seconds, and a session must be missed twice to count as ended. */
+const ENDED_AFTER_MS = 4_000
+
+const session = (text: string) => parseSession(text)!
+const none = new Set<string>()
+
 describe('model', () => {
-  test('reads a session record and ignores anything else', async () => {
-    expect(parseSession(OTHER)).toMatchObject({ pid: 200, sessionId: 'other', name: 'app-tests', procStart: '2000' })
+  test('reads a terminal or background session record and ignores anything else', async () => {
+    expect(parseSession(OTHER)).toMatchObject({ pid: 200, sessionId: OTHER_ID, name: 'app-tests', procStart: '2000' })
+    expect(parseSession(record({ pid: 5, sessionId: id(9), name: undefined }))?.name).toBe('app')
+    expect(parseSession(record({ pid: 5, sessionId: 'not-a-session-id!' }))).toBeNull()
+    expect(parseSession(HEADLESS)).toBeNull()
     expect(parseSession('{"pid":1}')).toBeNull()
     expect(parseSession('not json')).toBeNull()
-    expect(parseSession(record({ pid: 5, sessionId: 'x', name: undefined }))?.name).toBe('app')
+  })
+
+  test('only conversations get tabs: not spare workers, not terminals showing a background session', async () => {
+    expect(isConversation(session(OTHER))).toBe(true)
+    expect(isConversation(session(SPARE))).toBe(false)
+    expect(isConversation(session(PARKED))).toBe(false)
   })
 
   test('only <pid>.json files count, never the .key secrets beside them', async () => {
@@ -186,106 +262,315 @@ describe('model', () => {
     expect(await descendsFrom(100, 20, parentOf)).toBe(false)
   })
 
-  test('an empty or broken claude agents answer is not trusted', async () => {
-    expect([...(parseLivePids('[{"pid":1},{"pid":2,"x":3}]') ?? [])]).toEqual([1, 2])
-    expect(parseLivePids('[]')).toBeNull()
-    expect(parseLivePids('oops')).toBeNull()
+  test('reads the roster from claude agents --json --all, and distrusts an empty one', async () => {
+    const roster = parseRoster(JSON.stringify([{ pid: 9, kind: 'interactive' }, JOB, { kind: 'background', id: '-x', sessionId: JOB_ID }]))
+    expect(roster?.jobs.map(j => j.id)).toEqual(['b6e1f00d'])
+    expect([...(roster?.livePids ?? [])]).toEqual([9])
+    expect(parseRoster('[]')).toBeNull()
+    expect(parseRoster('oops')).toBeNull()
   })
 
   test('keeps the newest record of a session and orders by start time', async () => {
-    const older = parseSession(record({ pid: 7, sessionId: 'dup', name: 'old', startedAt: NOW - 5_000 }))!
-    const newer = parseSession(record({ pid: 8, sessionId: 'dup', name: 'new', startedAt: NOW - 1_000 }))!
-    const first = parseSession(record({ pid: 9, sessionId: 'first', name: 'first', startedAt: NOW - 9_000 }))!
+    const older = session(record({ pid: 7, sessionId: id(20), name: 'old', startedAt: NOW - 5_000 }))
+    const newer = session(record({ pid: 8, sessionId: id(20), name: 'new', startedAt: NOW - 1_000 }))
+    const first = session(record({ pid: 9, sessionId: id(21), name: 'first', startedAt: NOW - 9_000 }))
     expect(orderSessions([newer, older, first]).map(s => s.name)).toEqual(['first', 'new'])
     expect(orderSessions([older, newer]).map(s => s.pid)).toEqual([8])
   })
 
-  test('picks the most recently used client showing a pane', async () => {
-    expect(clientShowing('5 /dev/pts/1 %8\n9 /dev/pts/4 %8\n7 /dev/pts/2 %3', '%8')).toBe('/dev/pts/4')
-    expect(clientShowing('5 /dev/pts/1 %8', '%9')).toBeUndefined()
+  test('tabs: a new session opens one; gone and no longer present ends it; back again clears that', async () => {
+    const other = session(OTHER)
+    const { upserts: [opened] } = syncTabs([], none, [other], new Set([OTHER_ID]), [], NOW)
+    expect(opened).toMatchObject({ sessionId: OTHER_ID, name: 'app-tests', kind: 'interactive', pid: 200, procStart: '2000' })
+    expect(syncTabs([opened!], none, [other], new Set([OTHER_ID]), [], NOW + 1)).toEqual({ upserts: [], closes: [] })
+    // Missed once, still present: nothing changes yet.
+    expect(syncTabs([opened!], none, [], new Set([OTHER_ID]), [], NOW + 1).upserts).toEqual([])
+    const { upserts: [ended] } = syncTabs([opened!], none, [], none, [], NOW + 2)
+    expect(ended?.endedAt).toBe(NOW + 2)
+    const { upserts: [resumed] } = syncTabs([ended!], none, [other], new Set([OTHER_ID]), [], NOW + 3)
+    expect(resumed?.endedAt).toBeUndefined()
   })
 
-  test('badges, panes, ages and picking by number or name', async () => {
-    expect(badge(parseSession(OTHER)!).tone).toBe('working')
-    expect(badge(parseSession(ASKING)!)).toMatchObject({ tone: 'needs', label: 'input needed' })
-    expect(badge(parseSession(SELF)!).tone).toBe('idle')
+  test('tabs: a closed tab is never written, whatever its session does', async () => {
+    const other = session(OTHER)
+    const { upserts: [opened] } = syncTabs([], none, [other], new Set([OTHER_ID]), [], NOW)
+    const closed = new Set([OTHER_ID])
+    expect(syncTabs([opened!], closed, [{ ...other, name: 'renamed' }], closed, [], NOW)).toEqual({ upserts: [], closes: [] })
+    expect(syncTabs([opened!], closed, [], none, [], NOW)).toEqual({ upserts: [], closes: [] })
+  })
+
+  test('tabs: a terminal that starts a new conversation (/clear) keeps one tab, in the same place', async () => {
+    const other = session(OTHER)
+    const { upserts: [before] } = syncTabs([], none, [other], new Set([OTHER_ID]), [], NOW)
+    const cleared = { ...other, sessionId: id(30), name: 'app-tests-2' }
+    const { upserts, closes } = syncTabs([before!], none, [cleared], new Set([id(30)]), [], NOW + 1)
+    expect(closes).toEqual([OTHER_ID])
+    expect(upserts).toEqual([expect.objectContaining({ sessionId: id(30), name: 'app-tests-2', openedAt: before!.openedAt })])
+  })
+
+  test('tabs: a background session gets one; it closes only after a minute missing from a readable roster', async () => {
+    const job = parseRoster(JSON.stringify([JOB]))!.jobs[0]!
+    const { upserts: [opened] } = syncTabs([], none, [], none, [job], NOW)
+    expect(opened).toMatchObject({ sessionId: JOB_ID, kind: 'background', jobId: 'b6e1f00d', name: 'nightly-refactor' })
+    expect(syncTabs([opened!], none, [], none, null, NOW + 1)).toEqual({ upserts: [], closes: [] })
+    const { upserts: [missing] } = syncTabs([opened!], none, [], none, [], NOW + 1)
+    expect(missing?.missingSince).toBe(NOW + 1)
+    expect(syncTabs([missing!], none, [], none, [], NOW + MISSING_GRACE_MS).closes).toEqual([])
+    expect(syncTabs([missing!], none, [], none, [], NOW + 1 + MISSING_GRACE_MS).closes).toEqual([JOB_ID])
+    const { upserts: [back] } = syncTabs([missing!], none, [], none, [job], NOW + 2)
+    expect(back?.missingSince).toBeUndefined()
+  })
+
+  test('tabs: past the cap, the tabs whose sessions ended longest ago close', async () => {
+    const ended: TabRecord[] = Array.from({ length: MAX_TABS + 3 }, (_, i) => ({
+      sessionId: id(100 + i),
+      name: `t${i}`,
+      cwd: '/',
+      kind: 'interactive',
+      openedAt: i,
+      endedAt: 1_000 + i,
+    }))
+    expect(syncTabs(ended, none, [], none, [], NOW).closes).toEqual([id(100), id(101), id(102)])
+  })
+
+  test('open tabs are the unclosed ones, oldest first', async () => {
+    const a: TabRecord = { sessionId: id(1), name: 'a', cwd: '/', kind: 'interactive', openedAt: 2 }
+    const b: TabRecord = { sessionId: id(2), name: 'b', cwd: '/', kind: 'interactive', openedAt: 1 }
+    const c: TabRecord = { sessionId: id(3), name: 'c', cwd: '/', kind: 'interactive', openedAt: 0 }
+    expect(openTabs([a, b, c], new Set([id(3)]), [], []).map(t => t.record.name)).toEqual(['b', 'a'])
+  })
+
+  test('badges for running, waiting, finished and exited tabs', async () => {
+    const rec: TabRecord = { sessionId: JOB_ID, name: 'j', cwd: '/', kind: 'background', openedAt: 0 }
+    const job = (state: string) => ({ id: 'j', sessionId: JOB_ID, name: 'j', cwd: '/', state, startedAt: 0 })
+    expect(tabBadge({ record: rec, job: job('running') }).label).toBe('working')
+    expect(tabBadge({ record: rec, job: job('blocked') }).tone).toBe('needs')
+    expect(tabBadge({ record: rec, job: job('done') }).label).toBe('done')
+    expect(tabBadge({ record: rec, job: job('failed') }).label).toBe('failed')
+    expect(tabBadge({ record: rec, job: job('stopped') }).label).toBe('stopped')
+    expect(tabBadge({ record: rec }).label).toBe('paused')
+    // A finished job whose worker is still up, idle, reads as done, as agent view shows it.
+    const idleWorker = { ...session(OTHER), kind: 'bg' as const, status: 'idle' }
+    expect(tabBadge({ record: rec, job: job('done'), live: idleWorker }).label).toBe('done')
+    expect(tabBadge({ record: rec, job: job('running'), live: { ...idleWorker, status: 'busy' } }).label).toBe('working')
+    expect(tabBadge({ record: { ...rec, kind: 'interactive' } }).label).toBe('exited')
+    expect(badge(session(OTHER)).tone).toBe('working')
+    expect(badge(session(ASKING))).toMatchObject({ tone: 'needs', label: 'input needed' })
+  })
+
+  test('panes, clients, tmux text, ages and picking by number or name', async () => {
     expect(tmuxPane('0:@4.%7')).toBe('%7')
-    expect(tmuxPane('main:@12.%30')).toBe('%30')
     expect(tmuxPane(undefined)).toBeNull()
     expect(tmuxPane('garbage')).toBeNull()
+    expect(clientShowing('5 /dev/pts/1 %8\n9 /dev/pts/4 %8\n7 /dev/pts/2 %3', '%8')).toBe('/dev/pts/4')
+    expect(clientShowing('5 /dev/pts/1 %8', '%9')).toBeUndefined()
+    expect(windowName('fix #{pane_id} now')).toBe('fix {pane_id} now')
+    expect(windowName('')).toBe('claude')
+    expect(tmuxLiteral('/home/u/#tag')).toBe('/home/u/##tag')
     expect([5_000, 120_000, 7_200_000, 200_000_000].map(formatAge)).toEqual(['<1m', '2m', '2h', '2d'])
-    const tabs = orderSessions([SELF, OTHER, ASKING].map(text => parseSession(text)!))
-    expect(pick(tabs, '1')?.name).toBe('app-main')
-    expect(pick(tabs, 'app-t')?.name).toBe('app-tests')
-    expect(pick(tabs, 'DOCS')?.name).toBe('docs')
-    expect(pick(tabs, '9')).toBeUndefined()
+    const names = ['app-main', 'app-tests', 'docs']
+    expect(pick(names, '1', n => n)).toBe('app-main')
+    expect(pick(names, 'app-t', n => n)).toBe('app-tests')
+    expect(pick(names, 'DOCS', n => n)).toBe('docs')
+    expect(pick(names, '9', n => n)).toBeUndefined()
   })
 })
 
 describe('sidebar', () => {
-  test('lists the running sessions; hides a crashed one and one whose pid was reused', async ($, on) => {
-    const { reads } = machine(on, { links: ['600.json'] })
+  test('a tab per running conversation; never a crashed one, a reused pid, a spare, a client or a script', async ($, on) => {
+    const { reads } = machine(on, { links: ['900.json'] })
     await $.session.start(START)
     for (const surface of ['terminal', 'desktop'] as const) {
-      const ui = await $.ui.mount({ ...PANE, surface })
-      expect((await ui.find({ type: 'Text', text: /3 sessions/ }))?.text).toContain('1 needs you')
-      expect(await ui.find({ text: 'ghost' })).toBeUndefined()
-      expect(await ui.find({ text: 'recycled' })).toBeUndefined()
-      expect(await ui.find({ key: 'go-other' })).toBeDefined()
-      expect(await ui.find({ key: 'go-self' })).toBeUndefined()
+      const ui = await mountPane($, surface)
+      expect((await ui.find({ type: 'Text', text: /3 tabs/ }))?.text).toContain('1 needs you')
+      for (const hidden of ['ghost', 'recycled', 'spare', 'client', 'script']) expect(await ui.find({ text: hidden })).toBeUndefined()
+      expect(await ui.find({ key: `go-${OTHER_ID}` })).toBeDefined()
+      expect(await ui.find({ key: `go-${SELF_ID}` })).toBeUndefined()
       expect(await ui.find({ type: 'Text', text: /input needed 2m · app/ })).toBeDefined()
       await ui.unmount()
     }
     expect(reads.some(path => path.endsWith('.key'))).toBe(false)
-    expect(reads.some(path => path.endsWith('600.json'))).toBe(false)
+    expect(reads.some(path => path.endsWith('900.json'))).toBe(false)
   })
 
-  test('pressing a session switches the terminal showing this one to its pane', async ($, on) => {
-    const { switches } = machine(on)
+  test('a tab stays after its session exits, and opening it resumes the session in a new tmux window', async ($, on) => {
+    const { registry, tmux, clock } = machine(on)
     await $.session.start(START)
-    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-    await ui.press({ key: 'go-other' })
-    expect(switches()).toEqual([['tmux', 'switch-client', '-c', '/dev/pts/1', '-t', '%7']])
+    delete registry['200.json']
+    await clock.advance(2_000)
+    const ui = await mountPane($)
+    expect(await ui.find({ type: 'Text', text: /working 2m · tests/ })).toBeDefined() // missed once: shown as last seen
+    await clock.advance(2_000)
+    expect(await ui.find({ type: 'Text', text: /exited <1m · tests/ })).toBeDefined()
+    await ui.press({ key: `go-${OTHER_ID}` })
+    expect(tmux('new-window')).toEqual([
+      [
+        'tmux', 'new-window', '-d', '-P', '-F', '#{pane_id}', '-n', 'app-tests', '-c', '/home/u/dev/tests',
+        '-e', 'PATH=/usr/bin', '--', 'claude', '--resume', OTHER_ID,
+      ],
+    ])
+    expect(tmux('switch-client')).toEqual([['tmux', 'switch-client', '-c', '/dev/pts/1', '-t', '%41']])
+
+    // Pressed again while it starts up, it goes to the same window rather than opening another.
+    await ui.press({ key: `go-${OTHER_ID}` })
+    expect(tmux('new-window').length).toBe(1)
+    expect(tmux('switch-client').at(-1)).toEqual(['tmux', 'switch-client', '-c', '/dev/pts/1', '-t', '%41'])
     await ui.unmount()
   })
 
-  test('/tabs <name> switches without opening the sidebar', async ($, on) => {
-    const { switches } = machine(on)
+  test('/clear in a terminal keeps one tab in the same place, now on the new conversation', async ($, on) => {
+    const { registry, clock } = machine(on)
     await $.session.start(START)
-    await $.command.run({ ...TYPED, command: 'tabs', args: 'app-tests' })
-    expect(switches()).toEqual([['tmux', 'switch-client', '-c', '/dev/pts/1', '-t', '%7']])
+    registry['200.json'] = record({ pid: 200, procStart: '2000', sessionId: id(30), name: 'fresh-start', tmux: '0:@4.%7', cwd: '/home/u/dev/tests' })
+    await clock.advance(ENDED_AFTER_MS)
+    const ui = await mountPane($)
+    expect(await ui.find({ type: 'Text', text: /3 tabs/ })).toBeDefined()
+    expect((await ui.find({ key: `go-${id(30)}` }))?.text).toContain('fresh-start')
+    expect(await ui.find({ key: `go-${OTHER_ID}` })).toBeUndefined()
+    await ui.unmount()
   })
 
-  test('a pane with the same id on this tmux server but another program in it is not switched to', async ($, on) => {
-    const { switches } = machine(on, { panes: { '%7': 300, '%8': 10 } })
+  test('a session that ended before its first message leaves no tab behind', async ($, on) => {
+    const { registry, clock } = machine(on, { transcripts: [SELF_ID, OTHER_ID] })
     await $.session.start(START)
-    await $.command.run({ ...TYPED, command: 'tabs', args: 'app-tests' })
-    expect(switches()).toEqual([])
+    delete registry['300.json']
+    await clock.advance(ENDED_AFTER_MS)
+    const ui = await mountPane($)
+    expect(await ui.find({ text: 'docs' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /2 tabs/ })).toBeDefined()
+    await ui.unmount()
   })
 
-  test('a pane that is not on this tmux server is not switched to', async ($, on) => {
-    const { switches } = machine(on, { panes: { '%8': 10 } })
+  test('opening a tab with nothing saved says so and closes it, without opening a window', async ($, on) => {
+    const ended = { sessionId: id(9), name: 'lost', cwd: '/home/u/dev/app', kind: 'interactive', openedAt: 1, endedAt: 2 }
+    const { tmux, toasts } = machine(on, { stored: { [`tab:${id(9)}`]: ended } })
     await $.session.start(START)
-    await $.command.run({ ...TYPED, command: 'tabs', args: 'app-tests' })
-    expect(switches()).toEqual([])
+    await $.command.run(tabs('lost'))
+    expect(tmux('new-window')).toEqual([])
+    expect(toasts.at(-1)).toContain('nothing to reopen')
+    const ui = await mountPane($)
+    expect(await ui.find({ text: 'lost' })).toBeUndefined()
+    await ui.unmount()
   })
 
-  test('nothing runs tmux for a session outside tmux, from outside tmux, or for this session', async ($, on) => {
-    const { runs } = machine(on, { env: { HOME } })
+  test("a tab whose folder is gone isn't opened", async ($, on) => {
+    const { registry, tmux, toasts, clock } = machine(on, { gone: ['/home/u/dev/tests'] })
     await $.session.start(START)
-    await $.command.run({ ...TYPED, command: 'tabs', args: 'docs' })
-    await $.command.run({ ...TYPED, command: 'tabs', args: 'app-tests' })
-    await $.command.run({ ...TYPED, command: 'tabs', args: '1' })
-    expect(runs.some(argv => argv[0] === 'tmux')).toBe(false)
+    delete registry['200.json']
+    await clock.advance(ENDED_AFTER_MS)
+    await $.command.run(tabs('app-tests'))
+    expect(tmux('new-window')).toEqual([])
+    expect(toasts.at(-1)).toContain('is gone')
+  })
+
+  test('a window that dies as it opens is reported', async ($, on) => {
+    const { registry, toasts, clock } = machine(on)
+    await $.session.start(START)
+    delete registry['200.json']
+    await clock.advance(ENDED_AFTER_MS)
+    await $.command.run(tabs('app-tests'))
+    expect(toasts.some(text => text.includes('closed as it opened'))).toBe(false)
+    await clock.advance(2_000)
+    expect(toasts.some(text => text.includes('closed as it opened'))).toBe(true)
+  })
+
+  test('a background session gets a tab; opening it attaches in a new tmux window', async ($, on) => {
+    const { tmux } = machine(on, { jobs: [JOB] })
+    await $.session.start(START)
+    const ui = await mountPane($)
+    expect(await ui.find({ type: 'Text', text: /working 10m · api/ })).toBeDefined()
+    await ui.press({ key: `go-${JOB_ID}` })
+    expect(tmux('new-window')[0]?.slice(-4)).toEqual(['--', 'claude', 'attach', 'b6e1f00d'])
+    await ui.unmount()
+  })
+
+  test("a background session not yet in the roster isn't resumed in a second process", async ($, on) => {
+    const registry = { ...files(), '950.json': record({ pid: 950, procStart: '950', sessionId: id(40), name: 'starting', kind: 'bg' }) }
+    PROCS[950] = { ppid: 1, start: '950' }
+    const { tmux, toasts } = machine(on, { files: registry })
+    await $.session.start(START)
+    await $.command.run(tabs('starting'))
+    expect(tmux('new-window')).toEqual([])
+    expect(toasts.at(-1)).toContain('still starting')
+    delete PROCS[950]
+  })
+
+  test('a deleted background session closes its tab after a minute; a brief gap does not', async ($, on) => {
+    const { jobs, clock } = machine(on, { jobs: [JOB] })
+    await $.session.start(START)
+    jobs.length = 0
+    await clock.advance(30_000)
+    const ui = await mountPane($)
+    expect(await ui.find({ text: 'nightly-refactor' })).toBeDefined()
+    await clock.advance(50_000)
+    expect(await ui.find({ text: 'nightly-refactor' })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('closing a tab hides it for good, even while its session runs; /tabs reopen brings it back', async ($, on) => {
+    const { clock } = machine(on)
+    await $.session.start(START)
+    const ui = await mountPane($)
+    await ui.press({ key: `close-${OTHER_ID}` })
+    await clock.advance(2_000)
+    expect(await ui.find({ key: `go-${OTHER_ID}` })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /2 tabs/ })).toBeDefined()
+    await $.command.run(tabs('reopen'))
+    expect(await ui.find({ key: `go-${OTHER_ID}` })).toBeDefined()
+    await $.command.run(tabs('close docs'))
+    expect(await ui.find({ key: `go-${ASKING_ID}` })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('opening a running session switches the terminal showing this one to its pane', async ($, on) => {
+    const { tmux } = machine(on)
+    await $.session.start(START)
+    await $.command.run(tabs('app-tests'))
+    expect(tmux('switch-client')).toEqual([['tmux', 'switch-client', '-c', '/dev/pts/1', '-t', '%7']])
+    expect(tmux('new-window')).toEqual([])
+  })
+
+  test('a pane with the same id but another program in it is not switched to', async ($, on) => {
+    const { tmux, toasts } = machine(on, { panes: { '%7': 300, '%8': 10 } })
+    await $.session.start(START)
+    await $.command.run(tabs('app-tests'))
+    expect(tmux('switch-client')).toEqual([])
+    expect(toasts.at(-1)).toContain("isn't in a pane of this tmux server")
+  })
+
+  test('a running session missing from this tmux server is not switched to', async ($, on) => {
+    const { tmux } = machine(on, { panes: { '%8': 10 } })
+    await $.session.start(START)
+    await $.command.run(tabs('app-tests'))
+    expect(tmux('switch-client')).toEqual([])
+    expect(tmux('new-window')).toEqual([])
+  })
+
+  test('nothing runs tmux from outside tmux, for a session outside tmux, or for this session', async ($, on) => {
+    const outside = machine(on, { env: { HOME } })
+    await $.session.start(START)
+    for (const query of ['docs', 'app-tests', '1']) await $.command.run(tabs(query))
+    expect(outside.runs.some(argv => argv[0] === 'tmux')).toBe(false)
+    expect(outside.toasts.some(text => text.includes('claude --resume'))).toBe(true)
   })
 
   test('a tmux failure is reported, not thrown', async ($, on) => {
-    const { switches } = machine(on, { failTmux: true })
+    const { tmux, toasts } = machine(on, { failTmux: true })
     await $.session.start(START)
-    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-    await ui.press({ key: 'go-other' })
-    expect(switches()).toEqual([])
+    const ui = await mountPane($)
+    await ui.press({ key: `go-${OTHER_ID}` })
+    expect(tmux('switch-client')).toEqual([])
+    expect(toasts.at(-1)).toContain("Couldn't open app-tests")
     await ui.unmount()
+  })
+
+  test('a failed claude agents run is shared too: no retry for 10 seconds', async ($, on) => {
+    const { claudeRuns, clock } = machine(on, { failClaude: true })
+    await $.session.start(START)
+    await clock.advance(9_000)
+    expect(claudeRuns()).toBe(1)
+    await clock.advance(2_000)
+    expect(claudeRuns()).toBe(2)
   })
 
   test('opens by itself in a new session', async ($, on) => {
@@ -296,15 +581,15 @@ describe('sidebar', () => {
   })
 
   test('stays closed when the person closed it, and polls nothing while closed', async ($, on) => {
-    const { open, reads, clock } = machine(on, { stored: { autoOpen: false } })
+    const { open, reads, claudeRuns, clock } = machine(on, { stored: { autoOpen: false } })
     await $.session.start(START)
     await clock.settle()
     expect([...open]).toEqual([])
-    const before = reads.length
-    await clock.advance(10_000)
-    expect(reads.length).toBe(before)
+    const [readsBefore, runsBefore] = [reads.length, claudeRuns()]
+    await clock.advance(30_000)
+    expect([reads.length, claudeRuns()]).toEqual([readsBefore, runsBefore])
 
-    await $.command.run({ ...TYPED, command: 'tabs', args: '' })
+    await $.command.run(tabs(''))
     expect([...open]).toEqual(['session-tabs'])
     const opened = reads.length
     await clock.advance(2_000)
@@ -315,9 +600,9 @@ describe('sidebar', () => {
     const { open, clock } = machine(on, { failSessionId: true })
     await $.session.start(START)
     await clock.settle()
-    await $.command.run({ ...TYPED, command: 'tabs', args: '' })
+    await $.command.run(tabs(''))
     expect([...open]).toEqual([])
-    await $.command.run({ ...TYPED, command: 'tabs', args: '' })
+    await $.command.run(tabs(''))
     expect([...open]).toEqual(['session-tabs'])
   })
 
@@ -330,31 +615,22 @@ describe('sidebar', () => {
 })
 
 describe('without /proc', () => {
-  test('claude agents --json decides which sessions are running; this one always shows', async ($, on) => {
-    const { clock } = machine(on, { hasProc: false, agents: [200, 300] })
+  test('claude agents --json --all decides which sessions run; this one always shows', async ($, on) => {
+    const { clock } = machine(on, { hasProc: false })
     await $.session.start(START)
     await clock.settle()
-    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-    expect(await ui.find({ type: 'Text', text: /3 sessions/ })).toBeDefined()
+    const ui = await mountPane($)
+    expect(await ui.find({ type: 'Text', text: /3 tabs/ })).toBeDefined()
     expect(await ui.find({ text: 'ghost' })).toBeUndefined()
     expect(await ui.find({ text: /app-main/ })).toBeDefined()
     await ui.unmount()
   })
 
-  test('an empty answer hides nothing', async ($, on) => {
-    const { clock } = machine(on, { hasProc: false, agents: [] })
-    await $.session.start(START)
-    await clock.settle()
-    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-    expect(await ui.find({ type: 'Text', text: /5 sessions/ })).toBeDefined()
-    await ui.unmount()
-  })
-
   test('switching checks the pane with ps', async ($, on) => {
-    const { switches, runs } = machine(on, { hasProc: false, agents: [100, 200] })
+    const { tmux, runs } = machine(on, { hasProc: false })
     await $.session.start(START)
-    await $.command.run({ ...TYPED, command: 'tabs', args: 'app-tests' })
+    await $.command.run(tabs('app-tests'))
     expect(runs).toContainEqual(['ps', '-A', '-o', 'pid=,ppid='])
-    expect(switches()).toEqual([['tmux', 'switch-client', '-c', '/dev/pts/1', '-t', '%7']])
+    expect(tmux('switch-client')).toEqual([['tmux', 'switch-client', '-c', '/dev/pts/1', '-t', '%7']])
   })
 })
