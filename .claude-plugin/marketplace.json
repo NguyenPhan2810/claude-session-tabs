@@ -1,0 +1,17 @@
+{
+  "name": "session-tabs",
+  "owner": {
+    "name": "Nguyen Phan",
+    "url": "https://github.com/NguyenPhan2810"
+  },
+  "metadata": {
+    "description": "Vertical session tabs for the Claude Code terminal"
+  },
+  "plugins": [
+    {
+      "name": "session-tabs",
+      "source": "./",
+      "description": "Vertical session tabs for the Claude Code terminal: a sidebar listing every running session with its status, switching between them in tmux"
+    }
+  ]
+}
